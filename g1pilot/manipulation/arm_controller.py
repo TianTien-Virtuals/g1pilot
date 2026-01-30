@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time, threading, math
+# Try installing redis and redis-server in image
+# pip install redis
+# sudo apt update
+# sudo apt-get install redis-server
+# Then run redis in background
+# redis-server --daemonize yes
+
+import time, threading, math, json
 import numpy as np
+try:
+    import redis
+except ImportError:
+    redis = None
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
@@ -194,6 +205,15 @@ class ArmController(Node):
         self._goal_right_filt = None
         self._reset_after_home = False
         self._initialized = False
+
+        self.redis_client = None
+        if redis is not None:
+            try:
+                self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
+            except Exception:
+                pass
+        self._kps_arm_g1 = [40, 40, 40, 40, 20, 20, 20, 40, 40, 40, 40, 20, 20, 20]
+        self._kds_arm_g1 = [5, 5, 5, 5, 1, 1, 1, 5, 5, 5, 5, 1, 1, 1]
 
         self._T_off_right_static = self._mk_static_T(self._ee_off_right_xyz, self._ee_off_right_rpy_deg)
         self._T_off_left_static = self._mk_static_T(self._ee_off_left_xyz, self._ee_off_left_rpy_deg)
@@ -889,6 +909,44 @@ class ArmController(Node):
             self._hold_non_arm_joints()
             return
 
+        external_arm_q = None
+        print(self.redis_client)
+        if self.redis_client is not None:
+            try:
+                raw = self.redis_client.get("target_dof_pos_unitree_g1")
+                print(raw)
+                if raw is not None:
+                    ext = json.loads(raw)
+                    if isinstance(ext, (list, tuple)) and len(ext) == 29:
+                        external_arm_q = np.array(ext[15:29], dtype=float)
+            except Exception:
+                pass
+
+        if external_arm_q is not None and self.use_robot:
+        # if external_arm_q is not None:
+            dt = self._compute_dt()
+            max_step = self.arm_velocity_limit * dt
+            dq = np.clip(external_arm_q - self._last_q_target, -max_step, max_step)
+            q_smooth = self._last_q_target + dq
+            self._last_q_target = q_smooth.copy()
+            self.msg.mode_machine = self.get_mode_machine()
+            self.msg.mode_pr = 1
+            try:
+                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0
+            except Exception:
+                pass
+            for idx, jid in enumerate(G1_29_JointArmIndex):
+                self.msg.motor_cmd[jid].mode = 1
+                self.msg.motor_cmd[jid].q = float(q_smooth[idx])
+                self.msg.motor_cmd[jid].dq = 0.0
+                self.msg.motor_cmd[jid].tau = 0.0
+                self.msg.motor_cmd[jid].kp = float(self._kps_arm_g1[idx])
+                self.msg.motor_cmd[jid].kd = float(self._kds_arm_g1[idx])
+            self.msg.crc = self.crc.Crc(self.msg)
+            # print("test")
+            self.lowcmd_publisher.Write(self.msg)
+            return
+
         if self.homing_active:
             q_target = np.concatenate((self.home_left, self.home_right))
             if np.linalg.norm(q_target - self._last_q_target) < self.homing_tolerance:
@@ -989,7 +1047,7 @@ class ArmController(Node):
                     self.msg.motor_cmd[jid].kd = self.kd_low
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            # self.lowcmd_publisher.Write(self.msg)
         else:
             js = JointState()
             js.header.stamp = self.get_clock().now().to_msg()
